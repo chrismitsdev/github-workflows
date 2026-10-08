@@ -1,32 +1,80 @@
-name: Inspect Vercel deployments
+name: Cleanup stale Vercel deployments
 
 on:
+  schedule:
+    - cron: "0 * * * *"
+
   workflow_dispatch:
 
 jobs:
-  inspect:
+  cleanup:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Inspect Renovate deployments
+      - name: Find and delete stale Renovate deployments
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           set -euo pipefail
 
-          curl --fail --silent --show-error \
-            --get \
-            --url "https://api.vercel.com/v6/deployments" \
-            --data-urlencode "limit=100" \
-            --header "Authorization: Bearer $VERCEL_TOKEN" |
-          jq -r '
-            .deployments[]
-            | select(.meta.githubCommitRef // "" | startswith("renovate/"))
-            | {
-                uid,
-                url,
-                created,
-                state,
-                meta
-              }
-          '
+          echo "Checking Vercel deployments..."
+
+          deployments=$(
+            curl --fail --silent --show-error \
+              --get \
+              --url "https://api.vercel.com/v6/deployments" \
+              --data-urlencode "limit=100" \
+              --header "Authorization: Bearer $VERCEL_TOKEN"
+          )
+
+          echo "$deployments" |
+            jq -r '
+              .deployments[]
+              | select(.meta.githubCommitRef // "" | startswith("renovate/"))
+              | [
+                  .uid,
+                  .meta.githubOrg,
+                  .meta.githubRepo,
+                  .meta.githubCommitRef
+                ]
+              | @tsv
+            ' |
+          while IFS=$'\t' read -r deployment_id owner repo branch; do
+
+            echo ""
+            echo "Deployment: $deployment_id"
+            echo "Repository: $owner/$repo"
+            echo "Branch:     $branch"
+
+            status=$(
+              curl \
+                --silent \
+                --output /dev/null \
+                --write-out "%{http_code}" \
+                "https://api.github.com/repos/$owner/$repo/branches/$branch"
+            )
+
+            case "$status" in
+              200)
+                echo "Branch still exists. Keeping deployment."
+                ;;
+
+              404)
+                echo "Branch no longer exists."
+                echo "Deleting deployment..."
+
+                curl --fail --silent --show-error \
+                  --request DELETE \
+                  --url "https://api.vercel.com/v13/deployments/$deployment_id" \
+                  --header "Authorization: Bearer $VERCEL_TOKEN"
+
+                echo "Deleted: $deployment_id"
+                ;;
+
+              *)
+                echo "Unexpected GitHub response: HTTP $status"
+                echo "Skipping deployment for safety."
+                ;;
+            esac
+
+          done
