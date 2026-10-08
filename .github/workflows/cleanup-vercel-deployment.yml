@@ -1,0 +1,56 @@
+name: Cleanup Vercel deployment
+
+on:
+  workflow_call:
+    secrets:
+      VERCEL_TOKEN:
+        required: true
+
+jobs:
+  cleanup:
+    if: startsWith(github.event.ref, 'renovate/')
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Find and delete Vercel deployments
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          DELETED_BRANCH: ${{ github.event.ref }}
+        run: |
+          set -euo pipefail
+
+          echo "Deleted branch: $DELETED_BRANCH"
+
+          deployments=$(
+            curl --fail --silent --show-error \
+              --get \
+              --url "https://api.vercel.com/v6/deployments" \
+              --data-urlencode "repoId=${{ github.repository }}" \
+              --data-urlencode "limit=100" \
+              --header "Authorization: Bearer $VERCEL_TOKEN"
+          )
+
+          deployment_ids=$(
+            echo "$deployments" |
+              jq -r \
+                --arg branch "$DELETED_BRANCH" \
+                '.deployments[]
+                 | select(.meta.githubCommitRef == $branch)
+                 | .uid'
+          )
+
+          if [ -z "$deployment_ids" ]; then
+            echo "No Vercel deployments found for $DELETED_BRANCH"
+            exit 0
+          fi
+
+          while IFS= read -r deployment_id; do
+            echo "Deleting Vercel deployment: $deployment_id"
+
+            curl --fail --silent --show-error \
+              --request DELETE \
+              --url "https://api.vercel.com/v13/deployments/$deployment_id" \
+              --header "Authorization: Bearer $VERCEL_TOKEN"
+
+            echo "Deleted: $deployment_id"
+          done <<< "$deployment_ids"
