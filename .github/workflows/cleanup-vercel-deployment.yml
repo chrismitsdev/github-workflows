@@ -1,71 +1,32 @@
-name: Cleanup stale Vercel deployments
+name: Inspect Vercel deployments
 
 on:
-  schedule:
-    - cron: "0 * * * *"
-
   workflow_dispatch:
 
 jobs:
-  cleanup:
+  inspect:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Find stale Renovate deployments
+      - name: Inspect Renovate deployments
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
           set -euo pipefail
 
-          echo "Checking Vercel deployments..."
-
-          deployments=$(
-            curl --fail --silent --show-error \
-              --get \
-              --url "https://api.vercel.com/v6/deployments" \
-              --data-urlencode "limit=100" \
-              --header "Authorization: Bearer $VERCEL_TOKEN"
-          )
-
-          echo "$deployments" |
-            jq -r '
-              .deployments[]
-              | select(.meta.githubCommitRef // "" | startswith("renovate/"))
-              | [
-                  .uid,
-                  .meta.githubRepoOwner,
-                  .meta.githubRepoName,
-                  .meta.githubCommitRef
-                ]
-              | @tsv
-            ' |
-          while IFS=$'\t' read -r deployment_id owner repo branch; do
-
-            echo ""
-            echo "Deployment: $deployment_id"
-            echo "Repository: $owner/$repo"
-            echo "Branch:     $branch"
-
-            branch_exists=$(
-              curl \
-                --silent \
-                --output /dev/null \
-                --write-out "%{http_code}" \
-                "https://api.github.com/repos/$owner/$repo/branches/$branch"
-            )
-
-            if [ "$branch_exists" = "404" ]; then
-              echo "Branch no longer exists."
-              echo "Deleting deployment..."
-
-              curl --fail --silent --show-error \
-                --request DELETE \
-                --url "https://api.vercel.com/v13/deployments/$deployment_id" \
-                --header "Authorization: Bearer $VERCEL_TOKEN"
-
-              echo "Deleted $deployment_id"
-            else
-              echo "Branch still exists. Keeping deployment."
-            fi
-
-          done
+          curl --fail --silent --show-error \
+            --get \
+            --url "https://api.vercel.com/v6/deployments" \
+            --data-urlencode "limit=100" \
+            --header "Authorization: Bearer $VERCEL_TOKEN" |
+          jq -r '
+            .deployments[]
+            | select(.meta.githubCommitRef // "" | startswith("renovate/"))
+            | {
+                uid,
+                url,
+                created,
+                state,
+                meta
+              }
+          '
