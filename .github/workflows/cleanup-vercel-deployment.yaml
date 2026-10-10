@@ -29,9 +29,16 @@ jobs:
         run: |
           set -euo pipefail
 
-          vercel() { curl --fail --silent --show-error -H "Authorization: Bearer $VERCEL_TOKEN" "$@"; }
+          : "${VERCEL_TOKEN:?VERCEL_TOKEN is not set}"
+          : "${VERCEL_TEAM_ID:?VERCEL_TEAM_ID is not set}"
+
+          vercel() {
+            curl --fail --silent --show-error --retry 3 --max-time 30 \
+              -H "Authorization: Bearer $VERCEL_TOKEN" "$@"
+          }
           gh_status() {
             curl --silent --output /dev/null --write-out '%{http_code}' \
+              --retry 3 --max-time 30 \
               -H "Authorization: Bearer $GH_TOKEN" \
               -H "Accept: application/vnd.github+json" "$1"
           }
@@ -47,14 +54,17 @@ jobs:
               .deployments[]
               | select((.meta.githubCommitRef // "") | startswith("renovate/"))
               | select(.meta.githubOrg and .meta.githubRepo)
+              | select(.target != "production")
               | [.meta.githubOrg, .meta.githubRepo, .meta.githubCommitRef, .uid]
               | @tsv' <<<"$page" >> "$rows"
 
             until=$(jq -r '.pagination.next // empty' <<<"$page")
             [ -z "$until" ] && break
           done
+          [ -z "$until" ] || echo "WARN: stopped after 20 pages; older deployments were not checked"
 
-          cut -f1-3 "$rows" | sort -u | while IFS=$'\t' read -r owner repo branch; do
+          failed=0
+          while IFS=$'\t' read -r owner repo branch; do
             repo_status=$(gh_status "https://api.github.com/repos/$owner/$repo")
             if [ "$repo_status" != 200 ]; then
               echo "SKIP $owner/$repo (repo HTTP $repo_status)"; continue
@@ -65,15 +75,16 @@ jobs:
               echo "KEEP $owner/$repo@$branch (HTTP $status)"; continue
             fi
 
-            awk -F'\t' -v o="$owner" -v r="$repo" -v b="$branch" \
-              '$1==o && $2==r && $3==b {print $4}' "$rows" |
             while read -r id; do
               if [ "$DRY_RUN" = true ]; then
                 echo "DRY-RUN delete $id ($owner/$repo@$branch)"
               elif vercel -X DELETE "https://api.vercel.com/v13/deployments/$id?teamId=$VERCEL_TEAM_ID" >/dev/null; then
                 echo "DELETED $id ($owner/$repo@$branch)"
               else
-                echo "FAILED  $id"
+                echo "FAILED  $id"; failed=1
               fi
-            done
-          done
+            done < <(awk -F'\t' -v o="$owner" -v r="$repo" -v b="$branch" \
+              '$1==o && $2==r && $3==b {print $4}' "$rows")
+          done < <(cut -f1-3 "$rows" | sort -u)
+
+          exit "$failed"
