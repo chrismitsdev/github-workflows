@@ -1,6 +1,6 @@
 # github-workflows
 
-Standalone GitHub Actions workflows for personal projects.
+Standalone GitHub Action workflows for personal projects.
 
 ## cleanup-vercel-deployments.yml
 Keeps Vercel from piling up preview deployments for Renovate branches that no longer exist.  
