@@ -28,3 +28,23 @@ A failed delete doesn't stop the rest of the run, but the job exits with an erro
 - Scheduled runs delete for real. Manual runs default to `dry_run: true`.
 - The run aborts immediately if `VERCEL_TOKEN` or `VERCEL_TEAM_ID` is missing.
 - If `GH_READ_TOKEN` expires or loses access, repos show up as `SKIP` and nothing is deleted.
+
+## prune-vercel-deployments.yaml
+Keeps only the most recent Vercel deployments: the last 3 production deployments per project and the last preview deployment per branch.  
+It runs twice daily at 03:41 and 15:41 UTC, or manually from the Actions tab with an optional `dry_run` input (default `true`).  
+It shares the `vercel-cleanup` concurrency group with `cleanup-vercel-deployment.yaml`, so the two never delete at the same time.
+
+### How it works
+1. Pages through the Vercel team's `READY` deployments, newest first (up to 50 pages of 100). A `WARN` line is logged if the page cap is hit; older deployments are then left alone.
+2. Groups them per project: production in one group, previews per branch (or per project if `PREVIEW_SCOPE: project`). Renovate previews and custom environments are skipped, since `cleanup-vercel-deployment.yaml` handles Renovate.
+3. Deletes everything past the newest `KEEP_PRODUCTION` (3) / `KEEP_PREVIEW` (1) in each group.
+4. Never deletes the deployment currently serving production, even after an Instant Rollback. If it can't be determined, production deployments for that project are skipped.
+
+Each outcome is logged as `SKIP`, `KEEP`, `DRY-RUN`, `DELETED` or `FAILED`.
+
+### Setup
+Uses the same `VERCEL_TOKEN` secret and `VERCEL_TEAM_ID` variable as above. No GitHub token needed.
+
+### Notes
+- Errored, canceled and building deployments are not touched; Vercel's retention policy handles those.
+- Scheduled runs delete for real. Manual runs default to `dry_run: true`.

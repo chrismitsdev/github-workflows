@@ -1,0 +1,104 @@
+name: Prune old Vercel deployments
+
+on:
+  schedule:
+    - cron: "41 3,15 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        type: boolean
+        default: true
+
+permissions: {}
+
+concurrency:
+  group: vercel-cleanup # shared with the Renovate cleanup so they never delete at the same time
+  cancel-in-progress: false
+
+jobs:
+  prune:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Keep last 3 production + last preview per branch
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_TEAM_ID: ${{ vars.VERCEL_TEAM_ID }}
+          KEEP_PRODUCTION: 3
+          KEEP_PREVIEW: 1
+          PREVIEW_SCOPE: branch # "branch" = last N per branch, "project" = last N per project
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          : "${VERCEL_TOKEN:?VERCEL_TOKEN is not set}"
+          : "${VERCEL_TEAM_ID:?VERCEL_TEAM_ID is not set}"
+
+          vercel() {
+            curl --fail --silent --show-error --retry 3 --max-time 30 \
+              -H "Authorization: Bearer $VERCEL_TOKEN" "$@"
+          }
+
+          # 1. Fetch READY deployments, newest first.
+          all=$(mktemp)
+          until=""
+          for _ in $(seq 1 50); do
+            args=(--get --data-urlencode limit=100 --data-urlencode state=READY \
+                  --data-urlencode "teamId=$VERCEL_TEAM_ID")
+            [ -n "$until" ] && args+=(--data-urlencode "until=$until")
+            page=$(vercel "${args[@]}" https://api.vercel.com/v7/deployments)
+            jq -c '.deployments[]' <<<"$page" >> "$all"
+            until=$(jq -r '.pagination.next // empty' <<<"$page")
+            [ -z "$until" ] && break
+          done
+          # Hitting the cap is safe: only the newest deployments were fetched, so
+          # the ones kept are still correct and older ones are just left alone.
+          [ -z "$until" ] || echo "WARN: stopped after 50 pages; older deployments were not checked"
+
+          # 2. Work out which deployments to delete: everything past the newest N in each group.
+          #    Groups: production per project; preview per project+branch (or per project).
+          #    Renovate previews and custom environments are left alone.
+          candidates=$(jq -rs \
+            --argjson keepProd "$KEEP_PRODUCTION" \
+            --argjson keepPrev "$KEEP_PREVIEW" \
+            --arg scope "$PREVIEW_SCOPE" '
+            map(
+              (.meta.githubCommitRef // "") as $ref
+              | if .target == "production" then . + {grp: "production"}
+                elif .customEnvironment != null or ($ref | startswith("renovate/")) then empty
+                elif $scope == "branch" then . + {grp: ("preview:" + $ref)}
+                else . + {grp: "preview"} end
+            )
+            | group_by([.projectId, .grp])[]
+            | sort_by(-.created)
+            | .[(if .[0].grp == "production" then $keepProd else $keepPrev end):][]
+            | [.projectId, .uid, .grp, .url] | @tsv' "$all")
+
+          [ -z "$candidates" ] && { echo "Nothing to prune"; exit 0; }
+
+          # 3. Never delete the deployment currently serving production (it can be older
+          #    than the newest 3 after an Instant Rollback).
+          declare -A live
+          for pid in $(cut -f1 <<<"$candidates" | sort -u); do
+            live[$pid]=$(vercel "https://api.vercel.com/v9/projects/$pid?teamId=$VERCEL_TEAM_ID" \
+              | jq -r '.targets.production.id // empty')
+          done
+
+          failed=0
+          while IFS=$'\t' read -r pid id grp url; do
+            if [ "$grp" = production ] && [ -z "${live[$pid]}" ]; then
+              echo "SKIP    $id ($pid: could not determine live production deployment)"; continue
+            fi
+            if [ "$id" = "${live[$pid]}" ]; then
+              echo "KEEP    $id ($pid: live production)"; continue
+            fi
+            if [ "$DRY_RUN" = true ]; then
+              echo "DRY-RUN delete $id ($grp, $url)"
+            elif vercel -X DELETE "https://api.vercel.com/v13/deployments/$id?teamId=$VERCEL_TEAM_ID" >/dev/null; then
+              echo "DELETED $id ($grp, $url)"
+            else
+              echo "FAILED  $id"; failed=1
+            fi
+          done <<<"$candidates"
+
+          exit "$failed"
